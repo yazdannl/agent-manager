@@ -20,7 +20,10 @@ interface Candidate {
   command: string;
 }
 
-const SCAN_CACHE_MS = 800;
+const SCAN_CACHE_MS = 3000;
+// Every pid costs a handful of fs calls; running them all at once (600+ on this
+// host) spikes memory for no gain, so walk the list with a small pool.
+const SCAN_CONCURRENCY = 24;
 let scanCache: { at: number; processes: Map<string, AgentProcessInfo> } | null = null;
 
 export async function scanAgentProcesses(): Promise<Map<string, AgentProcessInfo>> {
@@ -46,12 +49,12 @@ export async function scanAgentProcessesFresh(): Promise<Map<string, AgentProces
   }
 
   const daemonPid = process.ppid;
+  const pids = entries
+    .filter((name) => /^\d+$/.test(name))
+    .map(Number)
+    .filter((pid) => pid !== process.pid && pid !== daemonPid);
   const candidates = (
-    await Promise.all(
-      entries
-        .filter((name) => /^\d+$/.test(name))
-        .map((name) => readCandidate(Number(name), daemonPid)),
-    )
+    await mapLimit(pids, SCAN_CONCURRENCY, (pid) => readCandidate(pid, daemonPid))
   ).filter((candidate): candidate is Candidate => candidate !== null);
 
   const byAgent = new Map<string, Candidate[]>();
@@ -80,12 +83,15 @@ export async function scanAgentProcessesFresh(): Promise<Map<string, AgentProces
 }
 
 async function readCandidate(pid: number, daemonPid: number): Promise<Candidate | null> {
-  const agentId = await readAgentId(pid);
-  if (!agentId) {
-    return null;
-  }
+  // Cheap gate first: only the daemon's children can be agent runtimes, and a
+  // /proc/<pid>/stat read is a few hundred bytes versus a full environ read.
+  // Reading environ first for every pid was the whole memory-growth bug.
   const stat = await readProcStat(pid);
   if (!stat || stat.ppid !== daemonPid) {
+    return null;
+  }
+  const agentId = await readAgentId(pid);
+  if (!agentId) {
     return null;
   }
   return {
@@ -95,6 +101,27 @@ async function readCandidate(pid: number, daemonPid: number): Promise<Candidate 
     rssBytes: await readResidentBytes(pid),
     command: await readCommand(pid),
   };
+}
+
+async function mapLimit<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) {
+        return;
+      }
+      results[index] = await worker(items[index] as T);
+    }
+  });
+  await Promise.all(runners);
+  return results;
 }
 
 async function readAgentId(pid: number): Promise<string | null> {
