@@ -133,8 +133,14 @@ export const autoReleaseStateSchema = z.object({
   removeEmptyWorkspaces: z.boolean(),
   closeIdleTerminals: z.boolean(),
   terminalIdleMinutes: z.number(),
+  /** Minutes a released session keeps its tab before it is archived; 0 disables archiving. */
+  archiveIdleMinutes: z.number(),
+  /** Minutes a `running` session may have no process before it is closed; 0 disables reaping. */
+  staleRunningMinutes: z.number(),
   lastRunAt: z.string().nullable(),
   lastReleased: z.array(z.object({ agentId: z.string(), title: z.string().nullable() })),
+  lastArchived: z.array(z.object({ agentId: z.string(), title: z.string().nullable() })),
+  lastReapedStale: z.array(z.object({ agentId: z.string(), title: z.string().nullable() })),
   lastRemovedWorkspaces: z.array(z.object({ workspaceId: z.string(), name: z.string().nullable() })),
   lastClosedTerminals: z.number().int(),
   lastSkipped: z.number().int(),
@@ -296,6 +302,8 @@ export const autoReleaseSetRpc = defineRpc({
     removeEmptyWorkspaces: z.boolean().optional(),
     closeIdleTerminals: z.boolean().optional(),
     terminalIdleMinutes: z.number().optional(),
+    archiveIdleMinutes: z.number().optional(),
+    staleRunningMinutes: z.number().optional(),
     runNow: z.boolean().optional(),
   }),
   output: autoReleaseStateSchema,

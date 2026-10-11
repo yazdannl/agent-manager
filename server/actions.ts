@@ -74,32 +74,20 @@ async function killOrSignal(
     await killAgentViaDaemonMcp(agentId);
     return { error: null, note: null };
   } catch (error) {
-    const reason = describe(error);
-    if (!allowSignalFallback || !target.isDaemonChild) {
-      return { error: reason, note: null };
-    }
-    const outcome = await signalFallback(agentId, target.pid, reason);
-    return outcome.ok ? { error: null, note: outcome.message } : { error: outcome.message, note: null };
+    // Deliberately no SIGTERM fallback. Killing the process behind the daemon's
+    // back leaves the manager holding a session whose RPC pipe is dead: the next
+    // message fails with "Pi RPC process is closed" and no runtime is respawned,
+    // so the session is bricked rather than released. The daemon's own kill_agent
+    // closes the session, persists the resumable snapshot and re-emits the agent,
+    // which is the only correct way to free the memory. If it cannot be reached,
+    // skip the release and leave the session intact and resumable.
+    return {
+      error: describe(error),
+      note: allowSignalFallback
+        ? "Signal fallback was requested but is unsafe; the session was left intact."
+        : null,
+    };
   }
-}
-
-async function signalFallback(
-  agentId: string,
-  pid: number,
-  reason: string,
-): Promise<{ ok: boolean; message: string }> {
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch (error) {
-    return { ok: false, message: `${reason} SIGTERM failed: ${describe(error)}` };
-  }
-  const exited = await waitForProcessesExit([pid]);
-  return exited.has(pid)
-    ? {
-        ok: true,
-        message: `Sent SIGTERM to pid ${pid}. The daemon may still report the session as idle until it is reloaded (paseo agent reload ${agentId.slice(0, 7)}). Reason: ${reason}`,
-      }
-    : { ok: false, message: `SIGTERM was sent but pid ${pid} is still running. Reason: ${reason}` };
 }
 
 async function waitForProcessesExit(pids: number[], timeoutMs = 3000): Promise<Set<number>> {

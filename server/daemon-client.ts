@@ -1,6 +1,9 @@
 import { createRequire } from "node:module";
 
-import { readDaemonConfig, resolveDaemonAddress } from "./daemon-mcp";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+
+import { paseoHome, readDaemonConfig, resolveDaemonAddress } from "./daemon-mcp";
 import { describe } from "./util";
 
 declare const require: ((specifier: string) => unknown) | undefined;
@@ -8,6 +11,25 @@ declare const require: ((specifier: string) => unknown) | undefined;
 const CLIENT_MODULE = "@getpaseo/client/internal/daemon-client";
 const CLIENT_ID_PREFIX = "agent-manager-";
 const DEFAULT_IDLE_CLOSE_MS = 180000;
+const LOCAL_CREDENTIAL_FILE = "local-credential";
+const BCRYPT_HASH = /^\$2[aby]\$\d{2}\$/;
+
+/**
+ * This daemon has a password set, and config.json only stores its bcrypt hash,
+ * which cannot be presented as a credential. The daemon instead authenticates
+ * local clients with the base64url token in ~/.paseo/local-credential, the same
+ * file the Paseo CLI uses; session-admission-auth.js accepts it as
+ * { kind: "localCredential" } and chooseConnectionAuth prefers it over a password.
+ * The token is read at connect time and only ever sent to the loopback daemon.
+ */
+async function readLocalCredentialToken(): Promise<string | undefined> {
+  try {
+    const token = (await readFile(join(paseoHome(), LOCAL_CREDENTIAL_FILE), "utf8")).trim();
+    return /^[A-Za-z0-9_-]{43}$/.test(token) ? token : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export interface WorkspaceRecoveryState {
   kind: string;
@@ -179,12 +201,16 @@ async function createDaemonClient(): Promise<DaemonSessionClient> {
   }
   const DaemonClient = loadDaemonClientConstructor();
   const config = await readDaemonConfig();
-  const password = process.env.PASEO_PASSWORD?.trim() || config.password;
+  const configured = process.env.PASEO_PASSWORD?.trim() || config.password;
+  // A stored bcrypt hash is not a credential; only offer it when it is plaintext.
+  const password = configured && !BCRYPT_HASH.test(configured) ? configured : undefined;
+  const localCredential = await readLocalCredentialToken();
   const client = new DaemonClient({
     url: `ws://${address.host}:${address.port}/ws`,
     clientId: `${CLIENT_ID_PREFIX}${randomSuffix()}`,
     clientType: "cli",
     appVersion: config.version ?? undefined,
+    ...(localCredential ? { localCredential: () => localCredential } : {}),
     ...(password ? { password } : {}),
     connectTimeoutMs: 15000,
     reconnect: { enabled: true, baseDelayMs: 500, maxDelayMs: 8000 },

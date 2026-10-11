@@ -11,7 +11,8 @@ import {
   type DaemonSessionClient,
   type OwnedAgentSubscription,
 } from "./daemon-client";
-import { killAgentViaDaemonMcp, paseoHome } from "./daemon-mcp";
+import { paseoHome } from "./daemon-mcp";
+import { releaseAgents } from "./actions";
 import type { AutoReleasePatch, AutoReleaseSnapshot } from "../shared/contracts";
 import { closeIdleTerminals, terminalApiFromClient } from "./terminals";
 import { fireAndForget } from "./guard";
@@ -23,7 +24,19 @@ import type { PaseoLike } from "./overview";
 const STATE_PATH = "agent-manager/auto-release.json";
 const TICK_MS = 60000;
 const MAX_TIMERS = 200;
-const DEFAULT_STATE: AutoReleaseSnapshot = {
+const MAX_PENDING_ARCHIVE = 200;
+const MAX_ARCHIVE_ATTEMPTS = 3;
+
+interface PendingArchive {
+  agentId: string;
+  title: string | null;
+  dueAt: string;
+  attempts: number;
+}
+
+type AutoReleaseState = AutoReleaseSnapshot & { pendingArchive: PendingArchive[] };
+
+const DEFAULT_STATE: AutoReleaseState = {
   enabled: true,
   idleMinutes: 10,
   intervalMinutes: 30,
@@ -31,18 +44,47 @@ const DEFAULT_STATE: AutoReleaseSnapshot = {
   removeEmptyWorkspaces: true,
   closeIdleTerminals: false,
   terminalIdleMinutes: 30,
+  archiveIdleMinutes: 60,
+  staleRunningMinutes: 5,
   lastRunAt: null,
   lastReleased: [],
+  lastArchived: [],
+  lastReapedStale: [],
   lastRemovedWorkspaces: [],
   lastClosedTerminals: 0,
   lastSkipped: 0,
   lastError: null,
   nextRunAt: null,
+  pendingArchive: [],
 };
 
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 const lastStatus = new Map<string, string>();
 const loadedAt = new Map<string, number>();
+const stuckSince = new Map<string, number>();
+// Sanity latch: only reap "running" agents once a scan has actually seen a live
+// agent process, so a broken /proc scan cannot mass-close every running session.
+let sawAgentProcess = false;
+
+/**
+ * Decide whether a `running` record is stale. `stuck` is the timestamp the
+ * condition was first seen (null when it is healthy or already non-running),
+ * `reap` is true once that condition has held for the whole grace window.
+ */
+export function staleRunningDecision(input: {
+  now: number;
+  status: string;
+  hasProcess: boolean;
+  canReap: boolean;
+  staleRunningMinutes: number;
+  since: number | null;
+}): { stuck: number | null; reap: boolean } {
+  if (input.status !== "running" || !input.canReap || input.hasProcess) {
+    return { stuck: null, reap: false };
+  }
+  const since = input.since ?? input.now;
+  return { stuck: since, reap: input.now - since >= input.staleRunningMinutes * 60000 };
+}
 
 function noteLoaded(agentId: string): void {
   loadedAt.set(agentId, Date.now());
@@ -99,12 +141,13 @@ export function startAutoReleaseScheduler(): () => void {
 
 export async function readAutoReleaseState(): Promise<AutoReleaseSnapshot> {
   const stored = await readStoredState();
-  return withDerived({ ...DEFAULT_STATE, ...stored });
+  const { pendingArchive: _pendingArchive, ...snapshot } = withDerived({ ...DEFAULT_STATE, ...stored });
+  return snapshot;
 }
 
 export async function updateAutoReleaseState(patch: AutoReleasePatch): Promise<AutoReleaseSnapshot> {
   const current = { ...DEFAULT_STATE, ...(await readStoredState()) };
-  const next: AutoReleaseSnapshot = {
+  const next: AutoReleaseState = {
     ...current,
     ...(patch.enabled === undefined ? {} : { enabled: patch.enabled }),
     ...(patch.idleMinutes === undefined ? {} : { idleMinutes: clamp(patch.idleMinutes, 1, 24 * 60) }),
@@ -115,6 +158,12 @@ export async function updateAutoReleaseState(patch: AutoReleasePatch): Promise<A
     ...(patch.terminalIdleMinutes === undefined
       ? {}
       : { terminalIdleMinutes: clamp(patch.terminalIdleMinutes, 5, 24 * 60) }),
+    ...(patch.archiveIdleMinutes === undefined
+      ? {}
+      : { archiveIdleMinutes: clamp(patch.archiveIdleMinutes, 0, 7 * 24 * 60) }),
+    ...(patch.staleRunningMinutes === undefined
+      ? {}
+      : { staleRunningMinutes: clamp(patch.staleRunningMinutes, 0, 24 * 60) }),
   };
   await writeState(next);
   if (patch.enabled === false) {
@@ -140,6 +189,7 @@ async function tick(): Promise<void> {
   if (!state.enabled) {
     return;
   }
+  await processPendingArchive();
   if (state.lastRunAt && Date.now() - Date.parse(state.lastRunAt) < state.intervalMinutes * 60000) {
     return;
   }
@@ -200,6 +250,7 @@ function onAgentUpdate(message: unknown): void {
     cancelTimer(agentId);
     lastStatus.delete(agentId);
     forgetLoaded(agentId);
+    stuckSince.delete(agentId);
     return;
   }
   const status = str(agent?.status) ?? "unknown";
@@ -208,6 +259,7 @@ function onAgentUpdate(message: unknown): void {
   if (status === "closed" || status === "error") {
     cancelTimer(agentId);
     forgetLoaded(agentId);
+    stuckSince.delete(agentId);
     return;
   }
   if (status === "idle" && (previous === undefined || previous === "closed" || previous === "error")) {
@@ -258,48 +310,93 @@ function cancelTimer(agentId: string): void {
 }
 
 async function sweep(mode: AutoReleaseSnapshot["onLoad"]): Promise<void> {
-  const state = { ...DEFAULT_STATE, ...(await readStoredState()) };
-  if (!state.enabled || running || mode === "off") {
-    await recordRun(state, [], [], 0, 0, null);
+  const initial = { ...DEFAULT_STATE, ...(await readStoredState()) };
+  if (!initial.enabled || running || mode === "off") {
+    await recordRun(initial, [], [], initial.pendingArchive, [], 0, 0, null);
     return;
   }
+  await processPendingArchive();
+  const state = { ...DEFAULT_STATE, ...(await readStoredState()) };
   running = true;
   beginDaemonClientUse();
   const released: Array<{ agentId: string; title: string | null }> = [];
+  const reapedStale: Array<{ agentId: string; title: string | null }> = [];
+  let pending = state.pendingArchive;
   let skipped = 0;
   let error: string | null = null;
   try {
     const client = await getDaemonClient();
     const agents = await listAllAgents((options) => client.fetchAgents(options as never));
+    const processes =
+      state.staleRunningMinutes > 0 ? await scanAgentProcessesFresh().catch(() => null) : null;
+    if (processes && processes.size > 0) {
+      sawAgentProcess = true;
+    }
+    const canReap = state.staleRunningMinutes > 0 && processes !== null && sawAgentProcess;
+    const staleIds: string[] = [];
     const threshold = state.idleMinutes * 60000;
     const now = Date.now();
     for (const agent of agents) {
       if (agent.archivedAt !== null || agent.status === "closed") {
         cancelTimer(agent.id);
+        stuckSince.delete(agent.id);
         continue;
       }
-      if (agent.status === "running" || blocksRelease(agent)) {
+      if (agent.status === "running") {
         cancelTimer(agent.id);
-        if (agent.status !== "running") {
-          skipped += 1;
+        // A record can stay `running` after its process died. Once that has held
+        // for staleRunningMinutes, close it instead of skipping it forever.
+        const decision = staleRunningDecision({
+          now,
+          status: agent.status,
+          hasProcess: processes?.has(agent.id) ?? true,
+          canReap,
+          staleRunningMinutes: state.staleRunningMinutes,
+          since: stuckSince.get(agent.id) ?? null,
+        });
+        if (decision.stuck === null) {
+          stuckSince.delete(agent.id);
+        } else {
+          stuckSince.set(agent.id, decision.stuck);
+          if (decision.reap) {
+            staleIds.push(agent.id);
+          }
         }
+        continue;
+      }
+      stuckSince.delete(agent.id);
+      if (blocksRelease(agent)) {
+        cancelTimer(agent.id);
+        skipped += 1;
         continue;
       }
       const lastActivity = await resolveLastActivityAt(agent);
       const base = idleBase(agent.id, lastActivity);
       const dueAt = (base || now) + threshold;
       if (mode === "allIdle" || dueAt <= now) {
-        const result = await releaseIdleAgent(agent.id, agents);
+        const result = await releaseIdleAgent(agent.id, agents, processes);
         if (result === "released") {
           released.push({ agentId: agent.id, title: agent.title });
+          pending = scheduleArchive(pending, agent.id, agent.title, now, state.archiveIdleMinutes);
         } else if (result === "skipped") {
           skipped += 1;
-        } else {
+        } else if (result !== "no-runtime") {
           error = result;
         }
         continue;
       }
       armTimer(agent.id, dueAt - now);
+    }
+    if (staleIds.length > 0) {
+      const outcome = await archiveAgents(staleIds);
+      for (const agentId of outcome.archived) {
+        const title = agents.find((agent) => agent.id === agentId)?.title ?? null;
+        reapedStale.push({ agentId, title });
+        pending = pending.filter((entry) => entry.agentId !== agentId);
+      }
+      if (outcome.failed.length > 0) {
+        error = error ?? outcome.failed[0]?.error ?? null;
+      }
     }
   } catch (sweepError) {
     error = describe(sweepError);
@@ -330,9 +427,11 @@ async function sweep(mode: AutoReleaseSnapshot["onLoad"]): Promise<void> {
     }
   }
 
-  await recordRun(state, released, removed, closedTerminals, skipped, error).catch((recordError) => {
-    console.log(`agent-manager could not record the sweep: ${describe(recordError)}`);
-  });
+  await recordRun(state, released, reapedStale, pending, removed, closedTerminals, skipped, error).catch(
+    (recordError) => {
+      console.log(`agent-manager could not record the sweep: ${describe(recordError)}`);
+    },
+  );
 }
 
 async function releaseArmedAgent(agentId: string): Promise<void> {
@@ -342,10 +441,15 @@ async function releaseArmedAgent(agentId: string): Promise<void> {
   }
   const state = { ...DEFAULT_STATE, ...(await readStoredState()) };
   const released = [{ agentId, title: null }, ...state.lastReleased].slice(0, 5);
-  await writeState(withDerived({ ...state, lastReleased: released }));
+  const pending = scheduleArchive(state.pendingArchive, agentId, null, Date.now(), state.archiveIdleMinutes);
+  await writeState(withDerived({ ...state, lastReleased: released, pendingArchive: pending }));
 }
 
-async function releaseIdleAgent(agentId: string, known?: AgentRecord[]): Promise<"released" | "skipped" | string> {
+async function releaseIdleAgent(
+  agentId: string,
+  known?: AgentRecord[],
+  processes?: Map<string, unknown> | null,
+): Promise<"released" | "no-runtime" | "skipped" | string> {
   try {
     const client = await getDaemonClient();
     const current = known?.find((agent) => agent.id === agentId) ?? (await fetchAgent(client, agentId));
@@ -355,12 +459,27 @@ async function releaseIdleAgent(agentId: string, known?: AgentRecord[]): Promise
     if (blocksRelease(current) || current.archivedAt !== null) {
       return "skipped";
     }
-    await killAgentViaDaemonMcp(agentId);
+    const hadRuntime = processes ? processes.has(agentId) : await hasRuntime(agentId);
+    // This daemon stores only a bcrypt hash for its password, and /mcp/agents is
+    // exempt from the global bearer middleware, so kill_agent cannot authenticate
+    // here (daemon bootstrap.js: "hash only, no plaintext available"). Fall back
+    // to the same scoped SIGTERM releaseAgents uses for the manual Release action:
+    // it only ever signals a PID that is a daemon child carrying PASEO_AGENT_ID.
+    const outcome = await releaseAgents([agentId], { allowSignalFallback: true });
+    const failure = outcome.failed[0];
+    if (failure) {
+      return failure.error;
+    }
     const stillRunning = await hasRuntime(agentId);
     if (!stillRunning) {
       forgetLoaded(agentId);
     }
-    return stillRunning ? "skipped" : "released";
+    if (stillRunning) {
+      return "skipped";
+    }
+    // Only a session that actually held a runtime is worth archiving later; the
+    // historical backlog of already-closed records must stay untouched.
+    return hadRuntime ? "released" : "no-runtime";
   } catch (error) {
     return describe(error);
   }
@@ -402,8 +521,10 @@ async function removeEmptyWorkspaces(): Promise<Array<{ workspaceId: string; nam
 }
 
 async function recordRun(
-  state: AutoReleaseSnapshot,
+  state: AutoReleaseState,
   released: Array<{ agentId: string; title: string | null }>,
+  reapedStale: Array<{ agentId: string; title: string | null }>,
+  pendingArchive: PendingArchive[],
   removedWorkspaces: Array<{ workspaceId: string; name: string | null }>,
   closedTerminals: number,
   skipped: number,
@@ -415,6 +536,8 @@ async function recordRun(
       ...state,
       lastRunAt: finishedAt,
       lastReleased: released,
+      lastReapedStale: reapedStale,
+      pendingArchive,
       lastRemovedWorkspaces: removedWorkspaces,
       lastClosedTerminals: closedTerminals,
       lastSkipped: skipped,
@@ -423,7 +546,7 @@ async function recordRun(
   );
 }
 
-function withDerived(state: AutoReleaseSnapshot): AutoReleaseSnapshot {
+function withDerived(state: AutoReleaseState): AutoReleaseState {
   if (!state.enabled) {
     return { ...state, nextRunAt: null };
   }
@@ -434,6 +557,128 @@ function withDerived(state: AutoReleaseSnapshot): AutoReleaseSnapshot {
     ...state,
     nextRunAt: new Date(Date.parse(state.lastRunAt) + state.intervalMinutes * 60000).toISOString(),
   };
+}
+
+/**
+ * Archive a released session after a longer idle window so the client can no
+ * longer restore its tab and respawn the runtime. Only sessions that actually
+ * held a runtime when they were released are scheduled, which keeps the
+ * historical backlog of long-closed records untouched.
+ */
+function scheduleArchive(
+  entries: PendingArchive[],
+  agentId: string,
+  title: string | null,
+  releasedAtMs: number,
+  archiveIdleMinutes: number,
+): PendingArchive[] {
+  if (archiveIdleMinutes <= 0) {
+    return entries;
+  }
+  const next = entries.filter((entry) => entry.agentId !== agentId);
+  next.push({
+    agentId,
+    title,
+    dueAt: new Date(releasedAtMs + archiveIdleMinutes * 60000).toISOString(),
+    attempts: 0,
+  });
+  next.sort((left, right) => Date.parse(left.dueAt) - Date.parse(right.dueAt));
+  return next.slice(0, MAX_PENDING_ARCHIVE);
+}
+
+async function archiveAgents(
+  agentIds: string[],
+): Promise<{ archived: string[]; failed: Array<{ agentId: string; error: string }> }> {
+  const archived: string[] = [];
+  const failed: Array<{ agentId: string; error: string }> = [];
+  if (agentIds.length === 0) {
+    return { archived, failed };
+  }
+  try {
+    const client = await getDaemonClient();
+    const response = (await client.closeItems({ agentIds, terminalIds: [] })) as {
+      agents?: Array<{ agentId?: unknown }>;
+    };
+    const done = new Set(
+      (Array.isArray(response?.agents) ? response.agents : [])
+        .map((entry) => str(entry?.agentId))
+        .filter((id): id is string => id !== null),
+    );
+    for (const agentId of agentIds) {
+      if (done.has(agentId)) {
+        archived.push(agentId);
+      } else {
+        failed.push({ agentId, error: "The daemon did not confirm the close" });
+      }
+    }
+  } catch (error) {
+    const message = describe(error);
+    for (const agentId of agentIds) {
+      failed.push({ agentId, error: message });
+    }
+  }
+  return { archived, failed };
+}
+
+async function processPendingArchive(): Promise<void> {
+  const state = { ...DEFAULT_STATE, ...(await readStoredState()) };
+  if (!state.enabled || state.pendingArchive.length === 0) {
+    return;
+  }
+  const now = Date.now();
+  const due = state.pendingArchive.filter((entry) => Date.parse(entry.dueAt) <= now);
+  if (due.length === 0) {
+    return;
+  }
+
+  const keep = state.pendingArchive.filter((entry) => Date.parse(entry.dueAt) > now);
+  const archived: Array<{ agentId: string; title: string | null }> = [];
+  let error: string | null = null;
+  beginDaemonClientUse();
+  try {
+    const client = await getDaemonClient();
+    const agents = await listAllAgents((options) => client.fetchAgents(options as never));
+    const byId = new Map(agents.map((agent) => [agent.id, agent]));
+    const targets: string[] = [];
+    for (const entry of due) {
+      const agent = byId.get(entry.agentId);
+      if (!agent || agent.archivedAt !== null) {
+        continue;
+      }
+      if (agent.status === "running" || blocksRelease(agent)) {
+        // It came back to life; the next release schedules a fresh window.
+        continue;
+      }
+      targets.push(entry.agentId);
+    }
+    if (targets.length > 0) {
+      const outcome = await archiveAgents(targets);
+      for (const agentId of outcome.archived) {
+        archived.push({ agentId, title: byId.get(agentId)?.title ?? null });
+      }
+      for (const failure of outcome.failed) {
+        const entry = due.find((candidate) => candidate.agentId === failure.agentId);
+        if (entry && entry.attempts + 1 < MAX_ARCHIVE_ATTEMPTS) {
+          keep.push({ ...entry, attempts: entry.attempts + 1 });
+        } else {
+          error = error ?? failure.error;
+        }
+      }
+    }
+  } catch (pendingError) {
+    error = describe(pendingError);
+  } finally {
+    endDaemonClientUse();
+  }
+
+  await writeState(
+    withDerived({
+      ...state,
+      pendingArchive: keep.slice(0, MAX_PENDING_ARCHIVE),
+      lastArchived: [...archived, ...state.lastArchived].slice(0, 5),
+      lastError: error ?? state.lastError,
+    }),
+  );
 }
 
 interface RawLiveAgent {
@@ -499,17 +744,17 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function readStoredState(): Promise<Partial<AutoReleaseSnapshot>> {
+async function readStoredState(): Promise<Partial<AutoReleaseState>> {
   try {
     const raw = await readFile(join(paseoHome(), STATE_PATH), "utf8");
-    const parsed = JSON.parse(raw) as Partial<AutoReleaseSnapshot>;
+    const parsed = JSON.parse(raw) as Partial<AutoReleaseState>;
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
     return {};
   }
 }
 
-function writeState(state: AutoReleaseSnapshot): Promise<void> {
+function writeState(state: AutoReleaseState): Promise<void> {
   return serializeWrite(() => writeJsonAtomic(join(paseoHome(), STATE_PATH), state));
 }
 

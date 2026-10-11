@@ -128,6 +128,18 @@ A session is released once it has been idle for the chosen timer (default 10 min
 session always gets its full window) unless it is waiting on a permission. This runs off the daemon's
 agent stream with a periodic safety sweep, so it keeps working while the app is closed.
 
+A released runtime is only a pause: opening the tab wakes the session again, which is exactly what a
+client does when it restores its layout on launch. `Archive released after` (default 60 minutes, `Off`
+disables) closes the session record instead, through the daemon's own `close_items` — the same path as
+closing a tab. The tab disappears, a restored layout can no longer resume the runtime, and the session
+stays in History where Restore brings it back. Only sessions that actually held a runtime when they
+were released are queued, so the historical backlog of already-closed records is never mass-archived.
+
+`Reap stale running after` (default 5 minutes, `Off` disables) closes sessions the daemon still reports
+as `running` although no process exists for them any more; the sweep used to skip those forever. It only
+acts once the process scan has seen at least one live agent process, so a broken scan cannot close every
+running session.
+
 `Close idle terminals` (off by default) extends the sweep to terminals and only uses positive evidence:
 either the daemon reports the terminal as idle for the whole timer, or — for terminals that never report
 activity — the process in it is still a plain shell with no children and nothing running, watched for

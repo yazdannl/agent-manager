@@ -12,11 +12,15 @@ export interface AutoReleasePatch {
   removeEmptyWorkspaces?: boolean;
   closeIdleTerminals?: boolean;
   terminalIdleMinutes?: number;
+  archiveIdleMinutes?: number;
+  staleRunningMinutes?: number;
   runNow?: boolean;
 }
 
 const IDLE_PRESETS = [5, 10, 15, 30, 60];
 const TERMINAL_PRESETS = [15, 30, 60, 120];
+const ARCHIVE_PRESETS = [0, 60, 360, 1440, 4320];
+const STALE_RUNNING_PRESETS = [0, 5, 15, 60];
 const ON_LOAD_MODES: Array<{ id: AutoReleaseSnapshot["onLoad"]; label: string }> = [
   { id: "threshold", label: "Respect timer" },
   { id: "allIdle", label: "All idle" },
@@ -29,8 +33,11 @@ export function settingsSummary(state: AutoReleaseSnapshot | undefined): string 
   }
   return [
     state.enabled ? `idle ${state.idleMinutes}m` : "off",
+    state.archiveIdleMinutes > 0 ? `archive ${formatMinutes(state.archiveIdleMinutes)}` : null,
     state.lastRunAt ? `last sweep ${formatTime(state.lastRunAt)}` : "no sweep yet",
     state.lastReleased.length > 0 ? `${state.lastReleased.length} released` : null,
+    state.lastArchived.length > 0 ? `${state.lastArchived.length} archived` : null,
+    state.lastReapedStale.length > 0 ? `${state.lastReapedStale.length} stale reaped` : null,
     state.lastClosedTerminals > 0 ? `${state.lastClosedTerminals} terminal(s) closed` : null,
     state.lastSkipped > 0 ? `${state.lastSkipped} waiting on you` : null,
     state.nextRunAt ? `next ${formatCountdown(state.nextRunAt)}` : null,
@@ -138,6 +145,32 @@ export function SettingsSection({
       </View>
       <View style={styles.autoDivider} />
       <View style={styles.autoRow}>
+        <Text style={styles.autoLabel}>Archive released after</Text>
+        {segmented(
+          "archive-idle",
+          ARCHIVE_PRESETS.map((minutes) => ({
+            id: `${minutes}`,
+            label: minutes === 0 ? "Off" : formatMinutes(minutes),
+          })),
+          `${state.archiveIdleMinutes}`,
+          (id) => onPatch({ archiveIdleMinutes: Number(id) }),
+        )}
+      </View>
+      <View style={styles.autoDivider} />
+      <View style={styles.autoRow}>
+        <Text style={styles.autoLabel}>Reap stale running after</Text>
+        {segmented(
+          "stale-running",
+          STALE_RUNNING_PRESETS.map((minutes) => ({
+            id: `${minutes}`,
+            label: minutes === 0 ? "Off" : `${minutes}m`,
+          })),
+          `${state.staleRunningMinutes}`,
+          (id) => onPatch({ staleRunningMinutes: Number(id) }),
+        )}
+      </View>
+      <View style={styles.autoDivider} />
+      <View style={styles.autoRow}>
         <Text style={styles.autoLabel}>After a reload</Text>
         {segmented("load", ON_LOAD_MODES, state.onLoad, (id) =>
           onPatch({ onLoad: id as AutoReleaseSnapshot["onLoad"] }),
@@ -203,6 +236,16 @@ export function SettingsSection({
       </Text>
     </View>
   );
+}
+
+function formatMinutes(minutes: number): string {
+  if (minutes >= 1440) {
+    return `${Math.round(minutes / 1440)}d`;
+  }
+  if (minutes >= 60) {
+    return `${Math.round(minutes / 60)}h`;
+  }
+  return `${minutes}m`;
 }
 
 function formatCountdown(value: string): string {
